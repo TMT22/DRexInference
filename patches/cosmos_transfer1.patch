@@ -1,0 +1,376 @@
+diff --git a/cosmos_predict1/diffusion/inference/diffusion_renderer_utils/utils_env_proj.py b/cosmos_predict1/diffusion/inference/diffusion_renderer_utils/utils_env_proj.py
+index d3450f1..cd76c3e 100644
+--- a/cosmos_predict1/diffusion/inference/diffusion_renderer_utils/utils_env_proj.py
++++ b/cosmos_predict1/diffusion/inference/diffusion_renderer_utils/utils_env_proj.py
+@@ -48,6 +48,7 @@ def process_environment_map(
+     pose_file=None,
+     pose_offset=0,
+     pose_reset=False,
++    pose_list=None,  # PATCH: pass explicit per-frame poses
+     rotate_envlight=False,
+     env_format=['proj', 'fixed', 'ball'],
+     log_scale=10000,
+@@ -106,6 +107,13 @@ def process_environment_map(
+         device=device
+     )
+ 
++    # PATCH: allow caller to supply explicit per-frame pose list
++    if pose_list is not None:
++        assert len(pose_list) == num_frames, (
++            f"Expected pose_list with {num_frames} poses, got {len(pose_list)}"
++        )
++        poses = pose_list
++
+     # Prepare rotations for the environment light
+     rots = np.linspace(0, 2 * np.pi, num_frames) if rotate_envlight else [0] * num_frames
+ 
+@@ -221,8 +229,16 @@ def prepare_camera_poses(num_frames, fixed_pose, pose_file, pose_offset, pose_re
+ 
+ def load_and_preprocess_hdr(hdr_dir, env_strength, env_flip, env_rot, device):
+     """Load and preprocess the HDR environment map."""
+-    latlong_img = imageio_v3.imread(hdr_dir, flags=cv2.IMREAD_UNCHANGED, plugin='opencv')
+-    latlong_img = torch.tensor(latlong_img, dtype=torch.float32, device=device)
++    # PATCH: use cv2 directly for .hdr to avoid imageio file-handle exhaustion
++    if hdr_dir.endswith('.hdr'):
++        latlong_img = cv2.imread(hdr_dir, cv2.IMREAD_UNCHANGED)
++        if latlong_img is None:
++            raise RuntimeError(f"Failed to load HDR image: {hdr_dir}")
++        latlong_img = cv2.cvtColor(latlong_img, cv2.COLOR_BGR2RGB)
++        latlong_img = torch.from_numpy(latlong_img).to(device=device, dtype=torch.float32)
++    else:
++        latlong_img = imageio_v3.imread(hdr_dir, flags=cv2.IMREAD_UNCHANGED, plugin='opencv')
++        latlong_img = torch.tensor(latlong_img, dtype=torch.float32, device=device)
+     latlong_img *= env_strength
+ 
+     # Cleanup NaNs and Infs
+diff --git a/cosmos_predict1/diffusion/inference/inference_utils.py b/cosmos_predict1/diffusion/inference/inference_utils.py
+index 3474140..bea0d4c 100644
+--- a/cosmos_predict1/diffusion/inference/inference_utils.py
++++ b/cosmos_predict1/diffusion/inference/inference_utils.py
+@@ -600,6 +600,8 @@ def read_video_or_image_into_frames_BCTHW(
+     normalize: bool = True,
+     max_frames: int = -1,
+     also_return_fps: bool = False,
++    rotate_90_clockwise: bool = False,  # PATCH
++    pad_with_zero: bool = False,        # PATCH
+ ) -> torch.Tensor:
+     """Read video or image file and convert to tensor format.
+ 
+@@ -641,6 +643,24 @@ def read_video_or_image_into_frames_BCTHW(
+         frames = frames[:max_frames]
+     input_tensor = np.stack(frames, axis=0)
+     input_tensor = einops.rearrange(input_tensor, "t h w c -> t c h w")
++    # PATCH: optional 90° rotation
++    if rotate_90_clockwise:
++        input_tensor = np.rot90(input_tensor, k=-1, axes=(2, 3))
++    # PATCH: pad width to reach target aspect ratio before downsampling
++    if pad_with_zero:
++        aspect_ratio_target = W / H
++        t, c, h, w = input_tensor.shape
++        target_w = int(h * aspect_ratio_target)
++        if target_w > w:
++            pad_total = target_w - w
++            pad_left = pad_total // 2
++            pad_right = pad_total - pad_left
++            input_tensor = np.pad(
++                input_tensor,
++                pad_width=((0, 0), (0, 0), (0, 0), (pad_left, pad_right)),
++                mode="constant",
++                constant_values=0,
++            )
+     if normalize:
+         input_tensor = input_tensor / 128.0 - 1.0
+         input_tensor = torch.from_numpy(input_tensor).bfloat16()  # TCHW
+diff --git a/cosmos_predict1/diffusion/model/model_diffusion_renderer.py b/cosmos_predict1/diffusion/model/model_diffusion_renderer.py
+index f5aca9d..fde41e6 100644
+--- a/cosmos_predict1/diffusion/model/model_diffusion_renderer.py
++++ b/cosmos_predict1/diffusion/model/model_diffusion_renderer.py
+@@ -137,6 +137,14 @@ class DiffusionRendererModel(DiffusionT2WModel):
+         """
+         condition, uncondition = self._get_conditions(data_batch, is_negative_prompt)
+ 
++        # PATCH: cast any float32 condition tensors to the model's dtype (bfloat16)
++        # to avoid downstream dtype mismatches in attention / norm layers.
++        con = condition.to_dict()
++        for k in con:
++            if isinstance(con[k], torch.Tensor) and con[k].dtype == torch.float32:
++                con[k] = con[k].to(**self.tensor_kwargs)
++        condition = type(condition)(**con)
++
+         self.scheduler.set_timesteps(num_steps)
+ 
+         xt = torch.randn(size=(n_sample,) + tuple(state_shape)) * self.scheduler.init_noise_sigma
+diff --git a/cosmos_predict1/diffusion/module/blocks.py b/cosmos_predict1/diffusion/module/blocks.py
+index 46b5522..59d0a54 100644
+--- a/cosmos_predict1/diffusion/module/blocks.py
++++ b/cosmos_predict1/diffusion/module/blocks.py
+@@ -338,7 +338,8 @@ class VideoAttn(nn.Module):
+ 
+ def adaln_norm_state(norm_state, x, scale, shift):
+     normalized = norm_state(x)
+-    return normalized * (1 + scale) + shift
++    # PATCH: cast to bfloat16 to avoid dtype mismatch with downstream layers
++    return (normalized * (1 + scale) + shift).to(torch.bfloat16)
+ 
+ 
+ class DITBuildingBlock(nn.Module):
+diff --git a/cosmos_predict1/diffusion/networks/general_dit.py b/cosmos_predict1/diffusion/networks/general_dit.py
+index 92ecf28..1dccb3d 100644
+--- a/cosmos_predict1/diffusion/networks/general_dit.py
++++ b/cosmos_predict1/diffusion/networks/general_dit.py
+@@ -27,7 +27,9 @@ from torchvision import transforms
+ 
+ from cosmos_predict1.diffusion.conditioner import DataType
+ from cosmos_predict1.diffusion.module.attention import get_normalization
+-from cosmos_predict1.diffusion.module.blocks import (
++# PATCH: use training.module.blocks so LoRA-aware PatchEmbed and
++# other training-time additions are picked up during fine-tuning.
++from cosmos_predict1.diffusion.training.module.blocks import (
+     FinalLayer,
+     GeneralDITTransformerBlock,
+     PatchEmbed,
+diff --git a/cosmos_predict1/diffusion/networks/general_dit_diffusion_renderer.py b/cosmos_predict1/diffusion/networks/general_dit_diffusion_renderer.py
+index 455922d..6364b0a 100644
+--- a/cosmos_predict1/diffusion/networks/general_dit_diffusion_renderer.py
++++ b/cosmos_predict1/diffusion/networks/general_dit_diffusion_renderer.py
+@@ -21,6 +21,7 @@ from torch import nn
+ import torch.distributed as dist
+ from torchvision import transforms
+ 
++from cosmos_predict1.diffusion.module.blocks import DITBuildingBlock  # PATCH
+ from cosmos_predict1.diffusion.conditioner import DataType
+ from cosmos_predict1.diffusion.networks.general_dit import GeneralDIT, PatchEmbed, VideoRopePosition3DEmb, log
+ from cosmos_predict1.diffusion.training.module.position_embedding import SinCosPosEmbAxis
+@@ -47,6 +48,26 @@ class DiffusionRendererGeneralDIT(GeneralDIT):
+             torch.nn.init.uniform_(self.context_embedding.weight, -0.3, 0.3)
+             torch.set_rng_state(rng_state)  # Restore the original random state
+ 
++    # PATCH: proper weight initialisation needed when fine-tuning from scratch
++    def init_weights(self):
++        def _basic_init(module):
++            if isinstance(module, torch.nn.Linear):
++                torch.nn.init.xavier_uniform_(module.weight)
++                if module.bias is not None:
++                    torch.nn.init.constant_(module.bias, 0)
++        self.apply(_basic_init)
++        torch.nn.init.normal_(self.t_embedder[1].linear_1.weight, std=0.02)
++        if self.t_embedder[1].linear_1.bias is not None:
++            torch.nn.init.constant_(self.t_embedder[1].linear_1.bias, 0)
++        torch.nn.init.normal_(self.t_embedder[1].linear_2.weight, std=0.02)
++        if self.t_embedder[1].linear_2.bias is not None:
++            torch.nn.init.constant_(self.t_embedder[1].linear_2.bias, 0)
++        for transformer_block in self.blocks.values():
++            for block in transformer_block.blocks:
++                torch.nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
++                if block.adaLN_modulation[-1].bias is not None:
++                    torch.nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
++
+     def build_pos_embed(self):
+         if self.pos_emb_cls == "rope3d":
+             cls_type = VideoRopePosition3DEmb
+@@ -147,6 +168,7 @@ class DiffusionRendererGeneralDIT(GeneralDIT):
+             x_B_C_T_H_W = torch.cat(
+                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
+             )
++        x_B_C_T_H_W = x_B_C_T_H_W.clone()  # PATCH: avoid in-place op error in x_embedder
+         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
+ 
+         if self.extra_per_block_abs_pos_emb:
+diff --git a/cosmos_predict1/diffusion/training/module/blocks.py b/cosmos_predict1/diffusion/training/module/blocks.py
+index 255ab48..048ab3a 100644
+--- a/cosmos_predict1/diffusion/training/module/blocks.py
++++ b/cosmos_predict1/diffusion/training/module/blocks.py
+@@ -28,6 +28,62 @@ from cosmos_predict1.diffusion.training.tensor_parallel import gather_along_firs
+ from cosmos_predict1.utils import log
+ 
+ 
++# PATCH: additional embedding utilities needed by the custom training stack
++
++class Timesteps(nn.Module):
++    """Sinusoidal timestep embedding (non-SDXL variant)."""
++    def __init__(self, num_channels):
++        super().__init__()
++        self.num_channels = num_channels
++
++    def forward(self, timesteps):
++        in_dtype = timesteps.dtype
++        half_dim = self.num_channels // 2
++        exponent = -math.log(10000) * torch.arange(half_dim, dtype=torch.float32,
++                                                    device=timesteps.device)
++        exponent = exponent / (half_dim - 0.0)
++        emb = torch.exp(exponent)
++        emb = timesteps[:, None].float() * emb[None, :]
++        emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim=-1)
++        return emb.to(in_dtype)
++
++
++class TimestepEmbedding(nn.Module):
++    """MLP timestep embedding (non-SDXL variant)."""
++    def __init__(self, in_features: int, out_features: int, use_adaln_lora: bool = False):
++        super().__init__()
++        self.linear_1 = nn.Linear(in_features, out_features, bias=not use_adaln_lora)
++        self.activation = nn.SiLU()
++        self.use_adaln_lora = use_adaln_lora
++        if use_adaln_lora:
++            self.linear_2 = nn.Linear(out_features, 3 * out_features, bias=False)
++        else:
++            self.linear_2 = nn.Linear(out_features, out_features, bias=True)
++
++    def forward(self, sample: torch.Tensor):
++        emb = self.linear_2(self.activation(self.linear_1(sample)))
++        if self.use_adaln_lora:
++            return sample, emb          # emb_B_D, adaln_lora_B_3D
++        return emb, None
++
++
++class FourierFeatures(nn.Module):
++    """Random Fourier feature layer. [B] -> [B, D]"""
++    def __init__(self, num_channels, bandwidth=1, normalize=False):
++        super().__init__()
++        self.register_buffer("freqs",
++            2 * np.pi * bandwidth * torch.randn(num_channels), persistent=True)
++        self.register_buffer("phases",
++            2 * np.pi * torch.rand(num_channels), persistent=True)
++        self.gain = np.sqrt(2) if normalize else 1.0
++
++    def forward(self, x, gain: float = 1.0):
++        in_dtype = x.dtype
++        x = (x.to(torch.float32).ger(self.freqs.to(torch.float32))
++               .add(self.phases.to(torch.float32)))
++        return x.cos().mul(self.gain * gain).to(in_dtype)
++
++
+ class SDXLTimesteps(nn.Module):
+     def __init__(self, num_channels: int = 320):
+         super().__init__()
+@@ -82,24 +138,9 @@ def modulate(x, shift, scale):
+     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+ 
+ 
+-class PatchEmbed(nn.Module):
+-    """
+-    PatchEmbed is a module for embedding patches from an input tensor by applying either 3D or 2D convolutional layers,
+-    depending on the . This module can process inputs with temporal (video) and spatial (image) dimensions,
+-    making it suitable for video and image processing tasks. It supports dividing the input into patches and embedding each
+-    patch into a vector of size `out_channels`.
+-
+-    Parameters:
+-    - spatial_patch_size (int): The size of each spatial patch.
+-    - temporal_patch_size (int): The size of each temporal patch.
+-    - in_channels (int): Number of input channels. Default: 3.
+-    - out_channels (int): The dimension of the embedding vector for each patch. Default: 768.
+-    - bias (bool): If True, adds a learnable bias to the output of the convolutional layers. Default: True.
+-    - keep_spatio (bool): If True, the spatial dimensions are kept separate in the output tensor, otherwise, they are flattened. Default: False.
+-    - legacy_patch_emb (bool): If True, applies 3D convolutional layers for video inputs, otherwise, use Linear! The legacy model is for backward compatibility. Default: True.
+-    The output shape of the module depends on the `keep_spatio` flag. If `keep_spatio`=True, the output retains the spatial dimensions.
+-    Otherwise, the spatial dimensions are flattened into a single dimension.
+-    """
++# PATCH: keep original under a different name so it can be referenced explicitly
++class PatchEmbedORG(nn.Module):
++    """Original conv3d-only PatchEmbed (preserved for reference)."""
+ 
+     def __init__(
+         self,
+@@ -164,6 +205,62 @@ class PatchEmbed(nn.Module):
+         return self.out(x)
+ 
+ 
++class PatchEmbed(nn.Module):
++    """
++    PatchEmbed that supports both legacy Conv3d and a linear (einops-based) projection.
++
++    Parameters:
++    - legacy_patch_emb (bool): If True, use Conv3d (same as PatchEmbedORG). Otherwise use Linear.
++    """
++
++    def __init__(
++        self,
++        spatial_patch_size,
++        temporal_patch_size,
++        in_channels=3,
++        out_channels=768,
++        bias=True,
++        keep_spatio=False,
++        legacy_patch_emb: bool = False,
++    ):
++        super().__init__()
++        self.spatial_patch_size = spatial_patch_size
++        self.temporal_patch_size = temporal_patch_size
++        self.keep_spatio = keep_spatio
++        self.legacy_patch_emb = legacy_patch_emb
++
++        if legacy_patch_emb:
++            self.proj = nn.Conv3d(
++                in_channels, out_channels,
++                kernel_size=(temporal_patch_size, spatial_patch_size, spatial_patch_size),
++                stride=(temporal_patch_size, spatial_patch_size, spatial_patch_size),
++                bias=bias,
++            )
++            self.out = Rearrange("b c t h w -> b t h w c")
++        else:
++            self.proj = nn.Sequential(
++                Rearrange(
++                    "b c (t r) (h m) (w n) -> b t h w (c r m n)",
++                    r=temporal_patch_size,
++                    m=spatial_patch_size,
++                    n=spatial_patch_size,
++                ),
++                nn.Linear(
++                    in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size,
++                    out_channels, bias=bias,
++                ),
++            )
++            self.out = nn.Identity()
++
++    def forward(self, x):
++        assert x.dim() == 5
++        _, _, T, H, W = x.shape
++        assert H % self.spatial_patch_size == 0 and W % self.spatial_patch_size == 0
++        assert T % self.temporal_patch_size == 0
++        x = self.proj(x)
++        return self.out(x)
++
++
+ class ExtraTokenPatchEmbed(PatchEmbed):
+     def __init__(self, *args, out_channels: int = 768, keep_spatio: bool = False, **kwargs):
+         assert keep_spatio, "ExtraTokenPatchEmbed only supports keep_spatio=True"
+@@ -516,6 +613,12 @@ class VideoAttn(nn.Module):
+             raise NotImplementedError(f"Unsupported x_format: {self.x_format}")
+ 
+ 
++def adaln_norm_state(norm_state, x, scale, shift):
++    """PATCH: bfloat16-casting variant used by training-time DiT blocks."""
++    normalized = norm_state(x)
++    return (normalized * (1 + scale) + shift).to(torch.bfloat16)
++
++
+ def checkpoint_norm_state(norm_state, x, scale, shift):
+     normalized = norm_state(x)
+     return normalized * (1 + scale) + shift
+diff --git a/cosmos_predict1/diffusion/training/utils/optim_instantiate.py b/cosmos_predict1/diffusion/training/utils/optim_instantiate.py
+index 96f45a6..2134d7c 100644
+--- a/cosmos_predict1/diffusion/training/utils/optim_instantiate.py
++++ b/cosmos_predict1/diffusion/training/utils/optim_instantiate.py
+@@ -40,6 +40,7 @@ def get_base_optimizer(
+     weight_decay: float,
+     optim_type: str = "adamw",
+     sharding: bool = False,
++    use_all_net_params: bool = False,  # PATCH: bypass decay/no-decay split
+     **kwargs,
+ ) -> torch.optim.Optimizer:
+     net_decay_param, net_nodecay_param = get_regular_param_group(model)
+@@ -47,11 +48,13 @@ def get_base_optimizer(
+     num_decay_params = sum(p.numel() for p in net_decay_param)
+     num_nodecay_params = sum(p.numel() for p in net_nodecay_param)
+     net_param_total = num_decay_params + num_nodecay_params
++    if use_all_net_params:
++        net_param_total = sum(p.numel() for p in model.parameters())
+     log.critical(f"total num parameters : {net_param_total:,}")
+ 
+     param_group = [
+         {
+-            "params": net_decay_param + net_nodecay_param,
++            "params": list(model.parameters()) if use_all_net_params else net_decay_param + net_nodecay_param,
+             "lr": lr,
+             "weight_decay": weight_decay,
+         },

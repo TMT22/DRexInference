@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# local runtime dirs
+workspace/
+cosmos_transfer1/checkpoints/
+
+.DS_Store

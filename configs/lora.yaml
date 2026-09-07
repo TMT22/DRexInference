@@ -1,0 +1,4 @@
+checkpoint_dir:     cosmos_transfer1/checkpoints
+lora_rank:          8
+lora_scale:         1.0
+lora_first_nblocks: 28
